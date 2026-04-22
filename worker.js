@@ -2,6 +2,7 @@ const TELEGRAM_API = (token) => `https://api.telegram.org/bot${token}`;
 const INTERLINK_API = (id) =>
   `https://prod.interlinklabs.ai/api/v1/ambassador-profile/get-profile/${id}`;
 const PROFILE_URL = (id) => `https://ambassador.interlinklabs.ai/en/${id}`;
+const userCooldown = new Map();
 
 export default {
   async fetch(request, env) {
@@ -41,6 +42,149 @@ async function setupWebhook(request, env) {
 }
 
 async function handleUpdate(update, env) {
+  // ================= CALLBACK HANDLER (Refresh) =================
+  if (update?.callback_query) {
+    const query = update.callback_query;
+    await fetch(`${TELEGRAM_API(env.BOT_TOKEN)}/answerCallbackQuery`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        callback_query_id: query.id,
+        show_alert: false,
+      }),
+    });
+    const chatId = query.message.chat.id;
+    const messageId = query.message.message_id;
+    const data = query.data;
+
+    const userId = data?.startsWith("refresh_") ? data.split("_")[1] : null;
+
+    if (data?.startsWith("refresh_") && userId) {
+      try {
+        await editMessage(env.BOT_TOKEN, chatId, messageId, "🔄 Refreshing...");
+
+        const res = await fetch(INTERLINK_API(userId));
+        const dataApi = await res.json();
+
+        if (!res.ok || !dataApi?.data?.haveProfile) {
+          return editMessage(
+            env.BOT_TOKEN,
+            chatId,
+            messageId,
+            "❌ Failed to refresh data",
+          );
+        }
+
+        const p = dataApi.data;
+
+        const acs =
+          typeof p.acs === "number" ? parseFloat(p.acs.toFixed(2)) : "N/A";
+
+        const textRes =
+          `<b>Profile Found Successfully ✅</b>\n\n` +
+          `👤 <b>Name:</b> ${p.firstName} ${p.lastName}\n` +
+          `🆔 <b>ID:</b> <code>${userId}</code>\n` +
+          `🌍 <b>Country:</b> ${p.country}\n` +
+          `🏅 <b>Level:</b> ${p.userMetadata?.tierNameAmbassador}\n` +
+          `⭐ <b>ACS:</b> ${acs}\n\n` +
+          `<i>Created by: <a href="https://t.me/imhamiddev">Hamid Dev</a></i>`;
+
+        const keyboard = {
+          inline_keyboard: [],
+        };
+
+        // social links
+        if (Array.isArray(p.socialLinks)) {
+          let row = [];
+
+          p.socialLinks.forEach((item) => {
+            if (item?.link && item?.social) {
+              row.push({
+                text: item.social.toUpperCase(),
+                url: item.link,
+                style: "danger",
+              });
+
+              if (row.length === 2) {
+                keyboard.inline_keyboard.push(row);
+                row = [];
+              }
+            }
+          });
+
+          if (row.length > 0) {
+            keyboard.inline_keyboard.push(row);
+          }
+        }
+
+        // main buttons
+        keyboard.inline_keyboard.push(
+          [
+            {
+              text: "🔄 Refresh",
+              callback_data: `refresh_${userId}`,
+              style: "primary",
+            },
+          ],
+          [
+            {
+              text: "View Profile",
+              url: PROFILE_URL(userId),
+              style: "success",
+            },
+          ],
+        );
+
+        return editMessage(env.BOT_TOKEN, chatId, messageId, text, keyboard);
+      } catch {
+        return editMessage(
+          env.BOT_TOKEN,
+          chatId,
+          messageId,
+          "⚠️ Error while refreshing",
+        );
+      }
+    }
+    if (data?.startsWith("profile_")) {
+      const userId = data?.split("_")?.[1];
+      if (!userId) return;
+
+      try {
+        const res = await fetch(INTERLINK_API(userId));
+        const d = await res.json();
+
+        if (!d?.data?.haveProfile) {
+          return editMessage(
+            env.BOT_TOKEN,
+            chatId,
+            messageId,
+            "❌ Profile not found",
+          );
+        }
+
+        const p = d.data;
+
+        const acs =
+          typeof p.acs === "number" ? parseFloat(p.acs.toFixed(2)) : "N/A";
+
+        const text =
+          `<b>Profile Details</b>\n\n` +
+          `👤 ${p.firstName} ${p.lastName}\n` +
+          `🆔 <code>${userId}</code>\n` +
+          `🌍 ${p.country}\n` +
+          `⭐ ${acs}`;
+
+        return editMessage(env.BOT_TOKEN, chatId, messageId, text);
+      } catch {
+        return editMessage(env.BOT_TOKEN, chatId, messageId, "⚠️ Error");
+      }
+    }
+
+    return;
+  }
+
+  // ================= MESSAGE HANDLER =================
+
   const message = update?.message;
   if (!message || !message.text) return;
 
@@ -48,128 +192,250 @@ async function handleUpdate(update, env) {
   const text = message.text.trim();
   const threadId = message.message_thread_id ?? null;
 
-  // /start command
+  // 🔥 Anti-spam (light)
+  const userIdUser = message?.from?.id;
+  if (!userIdUser) return;
+  const now = Date.now();
+
+  if (!globalThis.__cooldown) globalThis.__cooldown = new Map();
+
+  if (
+    globalThis.__cooldown.get(userIdUser) &&
+    now - globalThis.__cooldown.get(userIdUser) < 3000
+  ) {
+    return sendMessage(
+      env.BOT_TOKEN,
+      chatId,
+      "⏳ Please wait a moment...",
+      threadId,
+    );
+  }
+
+  globalThis.__cooldown.set(userIdUser, now);
+
+  // 🔥 typing action
+  await fetch(`${TELEGRAM_API(env.BOT_TOKEN)}/sendChatAction`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      chat_id: chatId,
+      action: "typing",
+    }),
+  });
+
+  // ================= /start =================
   if (text === "/start") {
     await sendMessage(
       env.BOT_TOKEN,
       chatId,
-      `👋 Hello! Welcome to the ACS Checker bot.\n\n` +
-        `To view the ACS score, send the following command:\n\n` +
-        `<code>/ACS [Numeric ID]</code>\n\n` +
-        `Example:\n<code>/ACS 000000</code>`,
+      `👋 Welcome to ACS Checker Bot!\n\nUse:\n<code>/ACS [ID]</code>`,
       threadId,
     );
     return;
   }
 
-  const acsMatch = text.match(/^\/ACS\s+(\d+)$/i);
-  if (acsMatch) {
-    const userId = acsMatch[1];
+  // ================= /compare =================
+  const compareMatch = text.match(/^\/compare\s+(\d+)\s+(\d+)$/i);
+  if (compareMatch) {
+    const id1 = compareMatch[1];
+    const id2 = compareMatch[2];
+
     try {
-      const res = await fetch(INTERLINK_API(userId));
-      const data = await res.json();
-      if (!res.ok || !data?.data?.haveProfile) {
-        await sendMessage(
+      const [r1, r2] = await Promise.all([
+        fetch(INTERLINK_API(id1)).then((r) => r.json()),
+        fetch(INTERLINK_API(id2)).then((r) => r.json()),
+      ]);
+
+      if (!r1.data?.haveProfile || !r2.data?.haveProfile) {
+        return sendMessage(
           env.BOT_TOKEN,
           chatId,
-          `❌ No profile found with ID <code>${userId}</code>.\n\nPlease check the ID.`,
+          "❌ One of the IDs is invalid",
           threadId,
         );
-        return;
       }
-      const profile = data.data;
-      const acs = profile.acs ?? "N/A";
-      const firstName = profile.firstName ?? "";
-      const lastName = profile.lastName ?? "";
-      const tier = profile.userMetadata?.tierNameAmbassador ?? "N/A";
-      const tierLevel = profile.userMetadata?.tierLevel ?? "";
-      const country = profile.country ?? "N/A";
-      const avatar = profile.avatar ?? null;
-      const responseText =
-        `<b>Here you go, this is the ambassador's info ✅</b>\n\n` +
-        `👤 <b>Name:</b> ${firstName} ${lastName}\n` +
-        `🆔 <b>ID:</b> <code>${userId}</code>\n` +
-        `🌍 <b>Region:</b> ${country}\n` +
-        `🏅 <b>Level:</b> ${tier} (Level${tierLevel})\n` +
-        `⭐ <b>ACS Score:</b> ${acs}`;
 
-      const buttons = [
-        [
-          {
-            text: "Profile",
-            url: PROFILE_URL(userId),
-            style: "primary",
-          },
+      const a = r1.data;
+      const b = r2.data;
+
+      const nameA =
+        `${a.firstName ?? ""} ${a.lastName ?? ""}`.trim() || "User A";
+      const nameB =
+        `${b.firstName ?? ""} ${b.lastName ?? ""}`.trim() || "User B";
+
+      const acsA = a.acs ?? 0;
+      const acsB = b.acs ?? 0;
+
+      const winner = acsA > acsB ? nameA : nameB;
+
+      const msg =
+        `⚔️ <b>Comparison</b>\n\n` +
+        `Select a user below to view profile 👇\n\n` +
+        `${nameA}: ${acsA}\n` +
+        `${nameB}: ${acsB}\n\n` +
+        `🏆 ${winner}`;
+      const keyboard = {
+        inline_keyboard: [
+          [
+            {
+              text: nameA,
+              callback_data: `profile_${id1}`,
+              style: "primary",
+            },
+          ],
+          [
+            {
+              text: nameB,
+              callback_data: `profile_${id2}`,
+              style: "primary",
+            },
+          ],
         ],
-      ];
-
-      if (Array.isArray(profile.socialLinks)) {
-        let row = [];
-
-        profile.socialLinks.forEach((item, index) => {
-          if (item?.link && item?.social) {
-            row.push({
-              text: item.social.toUpperCase(),
-              url: item.link,
-              style: "danger",
-            });
-
-            if (row.length === 2) {
-              buttons.push(row);
-              row = [];
-            }
-          }
-        });
-
-        if (row.length > 0) {
-          buttons.push(row);
-        }
-      }
-
-      const inlineKeyboard = {
-        inline_keyboard: buttons,
       };
+      return sendMessage(env.BOT_TOKEN, chatId, msg, threadId, keyboard);
+    } catch {
+      return sendMessage(env.BOT_TOKEN, chatId, "⚠️ Compare failed", threadId);
+    }
+  }
 
-      if (avatar) {
-        await fetch(`${TELEGRAM_API(env.BOT_TOKEN)}/sendPhoto`, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            chat_id: chatId,
-            photo: avatar,
-            caption: responseText,
-            parse_mode: "HTML",
-            reply_markup: inlineKeyboard,
-            ...(threadId && { message_thread_id: threadId }),
-          }),
-        });
-      } else {
-        await sendMessage(
-          env.BOT_TOKEN,
-          chatId,
-          responseText,
-          threadId,
-          inlineKeyboard,
-        );
-      }
-    } catch (err) {
-      await sendMessage(
+  // ================= /ACS =================
+  const acsMatch = text.match(/^\/ACS\s+(\d+)$/i);
+  if (!acsMatch) {
+    return sendMessage(
+      env.BOT_TOKEN,
+      chatId,
+      `❓ Unknown command\n<code>/ACS [ID]</code>`,
+      threadId,
+    );
+  }
+
+  const userId = acsMatch[1];
+
+  const loadingMsg = await sendMessageAndGetId(
+    env.BOT_TOKEN,
+    chatId,
+    "🔍 Searching user...\n\n[░░░░░░░░░░] 0%",
+    threadId,
+  );
+
+  const messageId = loadingMsg.result.message_id;
+
+  try {
+    for (let i = 1; i <= 10; i++) {
+      const percent = i * 10;
+      await new Promise((r) => setTimeout(r, 300));
+
+      await editMessage(
         env.BOT_TOKEN,
         chatId,
-        `Error - Try again ⚠️`,
+        messageId,
+        `🔍 Searching user...\n\n[${getProgressBar(percent)}] ${percent}%`,
+      );
+    }
+
+    const res = await fetch(INTERLINK_API(userId));
+    const data = await res.json();
+
+    await deleteMessage(env.BOT_TOKEN, chatId, messageId).catch(() => {});
+
+    if (!res.ok || !data?.data?.haveProfile) {
+      return sendMessage(
+        env.BOT_TOKEN,
+        chatId,
+        `❌ No profile found for <code>${userId}</code>.`,
         threadId,
       );
     }
-    return;
-  }
 
-  await sendMessage(
-    env.BOT_TOKEN,
-    chatId,
-    `❓ Unknown command.\n\nUse the following command:\n<code>/ACS [ID]</code>`,
-    threadId,
-  );
+    const p = data.data;
+
+    const acs =
+      typeof p.acs === "number" ? parseFloat(p.acs.toFixed(2)) : "N/A";
+
+    const textRes =
+      `<b>Profile Found Successfully ✅</b>\n\n` +
+      `👤 <b>Name:</b> ${p.firstName} ${p.lastName}\n` +
+      `🆔 <b>ID:</b> <code>${userId}</code>\n` +
+      `🌍 <b>Country:</b> ${p.country}\n` +
+      `🏅 <b>Level:</b> ${p.userMetadata?.tierNameAmbassador}\n` +
+      `⭐ <b>ACS:</b> ${acs}\n\n` +
+      `<i>Created by: <a href="https://t.me/imhamiddev">Hamid Dev</a></i>`;
+
+    const keyboard = {
+      inline_keyboard: [],
+    };
+
+    // social links
+    if (Array.isArray(p.socialLinks)) {
+      let row = [];
+
+      p.socialLinks.forEach((item) => {
+        if (item?.link && item?.social) {
+          row.push({
+            text: item.social.toUpperCase(),
+            url: item.link,
+            style: "danger",
+          });
+
+          if (row.length === 2) {
+            keyboard.inline_keyboard.push(row);
+            row = [];
+          }
+        }
+      });
+
+      if (row.length > 0) {
+        keyboard.inline_keyboard.push(row);
+      }
+    }
+
+    // main buttons
+    keyboard.inline_keyboard.push(
+      [
+        {
+          text: "🔄 Refresh",
+          callback_data: `refresh_${userId}`,
+          style: "primary",
+        },
+      ],
+      [
+        {
+          text: "View Profile",
+          url: PROFILE_URL(userId),
+          style: "success",
+        },
+      ],
+    );
+
+    if (p.avatar) {
+      await fetch(`${TELEGRAM_API(env.BOT_TOKEN)}/sendPhoto`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          chat_id: chatId,
+          photo: p.avatar,
+          caption: textRes,
+          parse_mode: "HTML",
+          reply_markup: keyboard,
+          ...(threadId && { message_thread_id: threadId }),
+        }),
+      });
+    } else {
+      await sendMessage(env.BOT_TOKEN, chatId, textRes, threadId, keyboard);
+    }
+  } catch (err) {
+    await deleteMessage(env.BOT_TOKEN, chatId, messageId);
+
+    return sendMessage(
+      env.BOT_TOKEN,
+      chatId,
+      "⚠️ Error fetching data",
+      threadId,
+    );
+  }
 }
+
+// ===== UTILS =====
 
 async function sendMessageAndGetId(token, chatId, text, threadId = null) {
   const body = {
@@ -187,34 +453,34 @@ async function sendMessageAndGetId(token, chatId, text, threadId = null) {
   return await res.json();
 }
 
-async function editMessage(token, chatId, messageId, text, replyMarkup = null) {
-  const body = {
-    chat_id: chatId,
-    message_id: messageId,
-    text: text,
-    parse_mode: "HTML",
-  };
-  if (replyMarkup) body.reply_markup = replyMarkup;
-
+async function editMessage(token, chatId, messageId, text) {
   await fetch(`${TELEGRAM_API(token)}/editMessageText`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(body),
+    body: JSON.stringify({
+      chat_id: chatId,
+      message_id: messageId,
+      text: text,
+      parse_mode: "HTML",
+    }),
   });
 }
 
-async function sendPhoto(token, chatId, photoUrl, threadId = null) {
-  const body = {
-    chat_id: chatId,
-    photo: photoUrl,
-  };
-  if (threadId) body.message_thread_id = threadId;
-
-  await fetch(`${TELEGRAM_API(token)}/sendPhoto`, {
+async function deleteMessage(token, chatId, messageId) {
+  await fetch(`${TELEGRAM_API(token)}/deleteMessage`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(body),
+    body: JSON.stringify({
+      chat_id: chatId,
+      message_id: messageId,
+    }),
   });
+}
+
+function getProgressBar(percent) {
+  const total = 10;
+  const filled = Math.round((percent / 100) * total);
+  return "█".repeat(filled) + "░".repeat(total - filled);
 }
 
 async function sendMessage(
